@@ -1,42 +1,239 @@
-require('dotenv').config(); 
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
+const csv = require('csv-parse/sync');
+require('dotenv').config();
+const xml2js = require('xml2js');
 
 const app = express();
-app.use(cors({
-  origin: '*'
-}));
+app.use(cors({ origin: '*' }));
 
 const TOKEN = process.env.TOKEN;
 
-app.get('/thing', async (req, res) => {
-  const id = req.query.id;
-  const response = await axios.get(
-    `https://api.geekdo.com/api/geekitems?objectid=${id}&objecttype=thing`,
-    { headers: { Authorization: `Bearer ${TOKEN}` } }
-  );
-  res.send(response.data);
+app.get('/api/bgg/search', async (req, res) => {
+  const { query } = req.query;
+  if (!query) return res.json([]);
+
+  try {
+    const response = await axios.get(
+      `https://boardgamegeek.com/xmlapi2/search?query=${encodeURIComponent(query)}&type=boardgame`,
+      { headers: { Authorization: `Bearer ${TOKEN}` } }
+    );
+    const result = await xml2js.parseStringPromise(response.data);
+    const items = (result.items.item || []).slice(0, 24);
+
+    const fetchGame = async (id) => {
+      try {
+        let response;
+        let attempts = 0;
+        do {
+          response = await axios.get(
+            `https://boardgamegeek.com/xmlapi2/thing?id=${id}`,
+            { headers: { Authorization: `Bearer ${TOKEN}` } }
+          );
+          if (response.status === 202) {
+            attempts++;
+            await new Promise(r => setTimeout(r, 2000));
+          }
+        } while (response.status === 202 && attempts < 5);
+
+        const parsed = await xml2js.parseStringPromise(response.data);
+        const item = parsed.items.item[0];
+        if (!item || !item.thumbnail?.[0]) return null;
+        return {
+          id: item.$.id,
+          name: item.name[0].$.value,
+          thumbnail: item.thumbnail[0],
+        };
+      } catch {
+        return null;
+      }
+    };
+
+    const ids = items.map(i => i.$.id);
+    const batchSize = 5;
+    let allGames = [];
+    for (let i = 0; i < ids.length; i += batchSize) {
+      const batch = ids.slice(i, i + batchSize);
+      const results = await Promise.all(batch.map(fetchGame));
+      allGames = [...allGames, ...results.filter(g => g !== null)];
+      if (i + batchSize < ids.length) {
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+
+    res.json(allGames);
+  } catch (err) {
+    console.error('Erro detalhado:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
+
+
+app.get('/api/bgg/thing/:id', async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    let response;
+    let attempts = 0;
+
+    do {
+      response = await axios.get(
+        `https://boardgamegeek.com/xmlapi2/thing?id=${id}`,
+        { headers: { Authorization: `Bearer ${TOKEN}` } }
+      );
+      if (response.status === 202) {
+        attempts++;
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    } while (response.status === 202 && attempts < 5);
+
+    const result = await xml2js.parseStringPromise(response.data);
+    const item = result.items.item[0];
+
+    // Retorna só o que você precisa
+    res.json({
+      id: item.$.id,
+      name: item.name[0].$.value,
+      image: item.image[0],
+      thumbnail: item.thumbnail[0],
+    });
+
+  } catch (err) {
+    console.error('Erro detalhado:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/bgg/image', async (req, res) => {
+  const { url } = req.query;
+  try {
+    const response = await axios.get(url, { responseType: 'arraybuffer' });
+    const contentType = response.headers['content-type'];
+    res.setHeader('Content-Type', contentType);
+    res.send(response.data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+app.get('/ping', (req, res) => res.send('ok'));
+
+let hotCache = null;
+
+
+app.get('/api/bgg/hot', async (req, res) => {
+  if (hotCache) {
+    console.log('Retornando do cache');
+    return res.json(hotCache);
+  }
+
+  try {
+    const hotResponse = await axios.get(
+      'https://boardgamegeek.com/xmlapi2/hot?type=boardgame',
+      { headers: { Authorization: `Bearer ${TOKEN}` } }
+    );
+    const hotResult = await xml2js.parseStringPromise(hotResponse.data);
+
+    const allGames = hotResult.items.item.map(item => ({
+      id: item.$.id,
+      rank: item.$.rank,
+      name: item.name[0].$.value,
+      thumbnail:  item.thumbnail[0].$.value,
+    }));
+    console.log('Thumbnail exemplo:', allGames[0].thumbnail);
+
+    hotCache = allGames;
+    console.log('Cache salvo com', allGames.length, 'jogos');
+    res.json(allGames);
+  } catch (err) {
+    console.error('Erro detalhado:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/bgg/ranked', async (req, res) => {
+  try {
+    const fetchGame = async (id) => {
+      let response;
+      let attempts = 0;
+      do {
+        response = await axios.get(
+          `https://boardgamegeek.com/xmlapi2/thing?id=${id}`,
+          { headers: { Authorization: `Bearer ${TOKEN}` } }
+        );
+        if (response.status === 202) {
+          attempts++;
+          await new Promise(r => setTimeout(r, 2000));
+        }
+      } while (response.status === 202 && attempts < 5);
+
+      const parsed = await xml2js.parseStringPromise(response.data);
+      const item = parsed.items?.item?.[0];
+      
+      // ID pode não existir no BGG, retorna null
+      if (!item || !item.image?.[0]) return null;
+
+      return {
+        id: item.$.id,
+        name: item.name[0].$.value,
+        image: item.image[0],
+        thumbnail: item.thumbnail[0],
+      };
+    };
+
+    // Gera 24 IDs aleatórios
+    const randomIds = Array.from({ length: 24 }, () =>
+      Math.floor(Math.random() * 400000) + 1
+    );
+
+    // Lotes de 3 com delay
+    const batchSize = 3;
+    let allGames = [];
+    for (let i = 0; i < randomIds.length; i += batchSize) {
+      const batch = randomIds.slice(i, i + batchSize);
+      const results = await Promise.all(batch.map(fetchGame));
+      // Filtra nulls (IDs que não existem)
+      allGames = [...allGames, ...results.filter(g => g !== null)];
+      await new Promise(r => setTimeout(r, 1000));
+    }
+
+    res.json(allGames);
+  } catch (err) {
+    console.error('Erro detalhado:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 app.get('/imagem', async (req, res) => {
   try {
     const url = req.query.url;
     const response = await axios.get(url, { responseType: 'arraybuffer' });
-    const contentType = response.headers['content-type'];
-    res.set('Content-Type', contentType);
+    res.set('Content-Type', response.headers['content-type']);
     res.send(response.data);
   } catch (error) {
     res.status(500).send(error.message);
   }
 });
 
-
-app.get('/ping', (req, res) => {
-  res.send('ok');
+app.get('/game', async (req, res) => {
+  try {
+    const response = await axios.get(
+      'http://boardgamegeek.com/xmlapi2/thing?type=boardgame',
+      { headers: { Authorization: `Bearer ${TOKEN}` } }
+    );
+    res.send(response.data);
+  } catch (error) {
+    console.log('Erro:', error.response?.status, JSON.stringify(error.response?.data));
+    res.status(500).send(error.message);
+  }
 });
 
 
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
+app.listen(PORT, async () => {
+  console.log(`Servidor rodando na porta ${PORT}`);
+
+});
