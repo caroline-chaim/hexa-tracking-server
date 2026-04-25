@@ -227,6 +227,48 @@ app.get('/api/bgg/test', async (req, res) => {
   }
 });
 
+app.get('/api/bgg/details/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    let response;
+    let attempts = 0;
+    do {
+      response = await axios.get(
+        `https://boardgamegeek.com/xmlapi2/thing?id=${id}&stats=1`,
+        { headers: { Authorization: `Bearer ${TOKEN}` } }
+      );
+      if (response.status === 202) {
+        attempts++;
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    } while (response.status === 202 && attempts < 5);
+
+    const result = await xml2js.parseStringPromise(response.data);
+    const item = result.items.item[0];
+    const stats = item.statistics?.[0]?.ratings?.[0];
+
+    res.json({
+      id: item.$.id,
+      name: item.name[0].$.value,
+      yearpublished: item.yearpublished?.[0]?.$.value ?? 'N/A',
+      image: item.image?.[0] ?? '',
+      thumbnail: item.thumbnail?.[0] ?? '',
+      description: item.description?.[0] ?? '',
+      minplayers: item.minplayers?.[0]?.$.value ?? 'N/A',
+      maxplayers: item.maxplayers?.[0]?.$.value ?? 'N/A',
+      minplaytime: item.minplaytime?.[0]?.$.value ?? 'N/A',
+      maxplaytime: item.maxplaytime?.[0]?.$.value ?? 'N/A',
+      minage: item.minage?.[0]?.$.value ?? 'N/A',
+      rating: parseFloat(stats?.average?.[0]?.$.value ?? 0).toFixed(1),
+      weight: parseFloat(stats?.averageweight?.[0]?.$.value ?? 0).toFixed(2),
+      rank: stats?.ranks?.[0]?.rank?.[0]?.$.value ?? 'N/A',
+    });
+  } catch (err) {
+    console.error('Erro detalhado:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
