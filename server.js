@@ -20,6 +20,7 @@ app.get('/api/bgg/search', async (req, res) => {
       { headers: { Authorization: `Bearer ${TOKEN}` } }
     );
     const result = await xml2js.parseStringPromise(response.data);
+    
     const items = (result.items.item || []).slice(0, 24);
 
     const fetchGame = async (id) => {
@@ -38,6 +39,7 @@ app.get('/api/bgg/search', async (req, res) => {
         } while (response.status === 202 && attempts < 5);
 
         const parsed = await xml2js.parseStringPromise(response.data);
+        
         const item = parsed.items.item[0];
         if (!item || !item.thumbnail?.[0]) return null;
         return {
@@ -153,59 +155,40 @@ app.get('/api/bgg/hot', async (req, res) => {
   }
 });
 
-app.get('/api/bgg/ranked', async (req, res) => {
+
+
+app.get('/api/bgg/batch', async (req, res) => {
+  const { ids } = req.query;
+  if (!ids) return res.json([]);
+
   try {
-    const fetchGame = async (id) => {
-      let response;
-      let attempts = 0;
-      do {
-        response = await axios.get(
-          `https://boardgamegeek.com/xmlapi2/thing?id=${id}`,
-          { headers: { Authorization: `Bearer ${TOKEN}` } }
-        );
-        if (response.status === 202) {
-          attempts++;
-          await new Promise(r => setTimeout(r, 2000));
-        }
-      } while (response.status === 202 && attempts < 5);
+    let response;
+    let attempts = 0;
+    do {
+      response = await axios.get(
+        `https://boardgamegeek.com/xmlapi2/thing?id=${ids}`,
+        { headers: { Authorization: `Bearer ${TOKEN}` } }
+      );
+      if (response.status === 202) {
+        attempts++;
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    } while (response.status === 202 && attempts < 5);
 
-      const parsed = await xml2js.parseStringPromise(response.data);
-      const item = parsed.items?.item?.[0];
-      
-      // ID pode não existir no BGG, retorna null
-      if (!item || !item.image?.[0]) return null;
+    const result = await xml2js.parseStringPromise(response.data);
+    const games = result.items.item.map(item => ({
+      id: item.$.id,
+      name: item.name[0].$.value,
+      image: item.image[0],
+      thumbnail: item.thumbnail[0],
+    }));
 
-      return {
-        id: item.$.id,
-        name: item.name[0].$.value,
-        image: item.image[0],
-        thumbnail: item.thumbnail[0],
-      };
-    };
-
-    // Gera 24 IDs aleatórios
-    const randomIds = Array.from({ length: 24 }, () =>
-      Math.floor(Math.random() * 400000) + 1
-    );
-
-    // Lotes de 3 com delay
-    const batchSize = 3;
-    let allGames = [];
-    for (let i = 0; i < randomIds.length; i += batchSize) {
-      const batch = randomIds.slice(i, i + batchSize);
-      const results = await Promise.all(batch.map(fetchGame));
-      // Filtra nulls (IDs que não existem)
-      allGames = [...allGames, ...results.filter(g => g !== null)];
-      await new Promise(r => setTimeout(r, 1000));
-    }
-
-    res.json(allGames);
+    res.json(games);
   } catch (err) {
     console.error('Erro detalhado:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
-
 
 app.get('/imagem', async (req, res) => {
   try {
@@ -228,6 +211,19 @@ app.get('/game', async (req, res) => {
   } catch (error) {
     console.log('Erro:', error.response?.status, JSON.stringify(error.response?.data));
     res.status(500).send(error.message);
+  }
+});
+
+
+app.get('/api/bgg/test', async (req, res) => {
+  try {
+    const response = await axios.get(
+      'https://boardgamegeek.com/xmlapi2/thing?from=2024-01-01&to=2024-12-31',
+      { headers: { Authorization: `Bearer ${TOKEN}` } }
+    );
+    res.send(response.data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
