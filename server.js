@@ -489,6 +489,628 @@ app.get('/library/:gameId/check', requireAuth, async (req, res) => {
 });
 
 
+// ── Configuração do container de partidas ──────────────────────────────────────
+const matchesContainer = database.container(process.env.COSMOS_MATCHES_CONTAINER);
+
+// POST /matches — salva uma partida finalizada
+app.post('/matches', requireAuth, async (req, res) => {
+  const { gameId, gameName, gameThumbnail, durationSeconds, result } = req.body;
+  if (!gameId || !result || durationSeconds === undefined) {
+    return res.status(400).json({ error: 'gameId, result e durationSeconds são obrigatórios' });
+  }
+  if (!['win', 'loss'].includes(result)) {
+    return res.status(400).json({ error: 'result deve ser "win" ou "loss"' });
+  }
+
+  try {
+    const match = {
+      id: `${req.user.userId}_${Date.now()}`,
+      userId: req.user.userId,
+      gameId,
+      gameName,
+      gameThumbnail: gameThumbnail ?? '',
+      durationSeconds,
+      result,
+      playedAt: new Date().toISOString(),
+    };
+    const { resource } = await matchesContainer.items.create(match);
+    res.status(201).json(resource);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro ao salvar partida' });
+  }
+});
+
+// GET /matches — retorna todas as partidas do usuário
+app.get('/matches', requireAuth, async (req, res) => {
+  try {
+    const { resources } = await matchesContainer.items
+      .query({
+        query: 'SELECT * FROM c WHERE c.userId = @userId ORDER BY c.playedAt DESC',
+        parameters: [{ name: '@userId', value: req.user.userId }],
+      })
+      .fetchAll();
+    res.json(resources);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro ao buscar partidas' });
+  }
+});
+
+// GET /matches/month — partidas do mês atual
+app.get('/matches/month', requireAuth, async (req, res) => {
+  const now = new Date();
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+
+  try {
+    const { resources } = await matchesContainer.items
+      .query({
+        query: 'SELECT * FROM c WHERE c.userId = @userId AND c.playedAt >= @start ORDER BY c.playedAt DESC',
+        parameters: [
+          { name: '@userId', value: req.user.userId },
+          { name: '@start', value: startOfMonth },
+        ],
+      })
+      .fetchAll();
+    res.json(resources);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro ao buscar partidas do mês' });
+  }
+});
+
+// ── Configuração do container de amizades ──────────────────────────────────────
+const friendshipsContainer = database.container(process.env.COSMOS_FRIENDSHIPS_CONTAINER);
+
+// POST /friends/request — envia solicitação por email
+app.post('/friends/request', requireAuth, async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'email obrigatório' });
+  if (email === req.user.email) return res.status(400).json({ error: 'Você não pode adicionar a si mesmo' });
+
+  try {
+    // Busca o usuário alvo pelo email
+    const { resources: targets } = await usersContainer.items
+      .query({
+        query: 'SELECT * FROM c WHERE c.email = @email',
+        parameters: [{ name: '@email', value: email }],
+      })
+      .fetchAll();
+
+    if (targets.length === 0) return res.status(404).json({ error: 'Usuário não encontrado' });
+    const target = targets[0];
+
+    // Verifica se já existe solicitação ou amizade
+    const { resources: existing } = await friendshipsContainer.items
+      .query({
+        query: `SELECT * FROM c WHERE 
+          (c.fromUserId = @me AND c.toUserId = @them) OR 
+          (c.fromUserId = @them AND c.toUserId = @me)`,
+        parameters: [
+          { name: '@me', value: req.user.userId },
+          { name: '@them', value: target.id },
+        ],
+      })
+      .fetchAll();
+
+    if (existing.length > 0) {
+      const status = existing[0].status;
+      if (status === 'accepted') return res.status(409).json({ error: 'Já são amigos' });
+      if (status === 'pending') return res.status(409).json({ error: 'Solicitação já enviada' });
+    }
+
+    const { resource } = await friendshipsContainer.items.create({
+      id: `${req.user.userId}_${target.id}`,
+      userId: req.user.userId, // partition key
+      fromUserId: req.user.userId,
+      fromEmail: req.user.email,
+      toUserId: target.id,
+      toEmail: target.email,
+      toDisplayName: target.displayName,
+      toPhotoUrl: target.photoUrl,
+      fromDisplayName: '',
+      fromPhotoUrl: '',
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+    });
+
+    // Cria também o lado do destinatário para facilitar queries
+    await friendshipsContainer.items.create({
+      id: `${target.id}_${req.user.userId}`,
+      userId: target.id,
+      fromUserId: req.user.userId,
+      fromEmail: req.user.email,
+      toUserId: target.id,
+      toEmail: target.email,
+      toDisplayName: target.displayName,
+      toPhotoUrl: target.photoUrl,
+      fromDisplayName: '',
+      fromPhotoUrl: '',
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+    });
+
+    res.status(201).json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro ao enviar solicitação' });
+  }
+});
+
+// GET /friends/requests — solicitações pendentes recebidas
+app.get('/friends/requests', requireAuth, async (req, res) => {
+  try {
+    const { resources } = await friendshipsContainer.items
+      .query({
+        query: `SELECT * FROM c WHERE c.userId = @me AND c.toUserId = @me AND c.status = 'pending'`,
+        parameters: [{ name: '@me', value: req.user.userId }],
+      })
+      .fetchAll();
+
+    // Busca displayName/photo do remetente
+    const enriched = await Promise.all(resources.map(async (r) => {
+      try {
+        const { resource: sender } = await usersContainer.item(r.fromUserId, r.fromUserId).read();
+        return {
+          ...r,
+          fromDisplayName: sender?.displayName ?? r.fromEmail,
+          fromPhotoUrl: sender?.photoUrl ?? '',
+        };
+      } catch {
+        return { ...r, fromDisplayName: r.fromEmail, fromPhotoUrl: '' };
+      }
+    }));
+
+    res.json(enriched);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro ao buscar solicitações' });
+  }
+});
+
+// POST /friends/accept/:fromUserId — aceita solicitação
+app.post('/friends/accept/:fromUserId', requireAuth, async (req, res) => {
+  const { fromUserId } = req.params;
+  try {
+    // Atualiza lado do destinatário
+    const docId1 = `${req.user.userId}_${fromUserId}`;
+    const { resource: doc1 } = await friendshipsContainer.item(docId1, req.user.userId).read();
+    if (!doc1) return res.status(404).json({ error: 'Solicitação não encontrada' });
+    await friendshipsContainer.item(docId1, req.user.userId).replace({ ...doc1, status: 'accepted' });
+
+    // Atualiza lado do remetente
+    const docId2 = `${fromUserId}_${req.user.userId}`;
+    try {
+      const { resource: doc2 } = await friendshipsContainer.item(docId2, fromUserId).read();
+      if (doc2) await friendshipsContainer.item(docId2, fromUserId).replace({ ...doc2, status: 'accepted' });
+    } catch {}
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro ao aceitar solicitação' });
+  }
+});
+
+// POST /friends/decline/:fromUserId — recusa solicitação
+app.post('/friends/decline/:fromUserId', requireAuth, async (req, res) => {
+  const { fromUserId } = req.params;
+  try {
+    const docId1 = `${req.user.userId}_${fromUserId}`;
+    await friendshipsContainer.item(docId1, req.user.userId).delete();
+    try {
+      const docId2 = `${fromUserId}_${req.user.userId}`;
+      await friendshipsContainer.item(docId2, fromUserId).delete();
+    } catch {}
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro ao recusar solicitação' });
+  }
+});
+
+// GET /friends — lista amigos aceitos
+app.get('/friends', requireAuth, async (req, res) => {
+  try {
+    const { resources } = await friendshipsContainer.items
+      .query({
+        query: `SELECT * FROM c WHERE c.userId = @me AND c.status = 'accepted'`,
+        parameters: [{ name: '@me', value: req.user.userId }],
+      })
+      .fetchAll();
+
+    const friends = await Promise.all(resources.map(async (r) => {
+      const friendId = r.fromUserId === req.user.userId ? r.toUserId : r.fromUserId;
+      try {
+        const { resource: friend } = await usersContainer.item(friendId, friendId).read();
+        return {
+          id: friendId,
+          displayName: friend?.displayName ?? friendId,
+          email: friend?.email ?? '',
+          photoUrl: friend?.photoUrl ?? '',
+        };
+      } catch {
+        return { id: friendId, displayName: friendId, email: '', photoUrl: '' };
+      }
+    }));
+
+    res.json(friends);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro ao buscar amigos' });
+  }
+});
+
+// DELETE /friends/:friendId — remove amigo
+app.delete('/friends/:friendId', requireAuth, async (req, res) => {
+  const { friendId } = req.params;
+  try {
+    try { await friendshipsContainer.item(`${req.user.userId}_${friendId}`, req.user.userId).delete(); } catch {}
+    try { await friendshipsContainer.item(`${friendId}_${req.user.userId}`, friendId).delete(); } catch {}
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao remover amigo' });
+  }
+});
+
+// GET /friends/:friendId/library — biblioteca do amigo
+app.get('/friends/:friendId/library', requireAuth, async (req, res) => {
+  const { friendId } = req.params;
+  try {
+    // Verifica se são amigos
+    const { resources } = await friendshipsContainer.items
+      .query({
+        query: `SELECT * FROM c WHERE c.userId = @me AND c.status = 'accepted' AND (c.toUserId = @friend OR c.fromUserId = @friend)`,
+        parameters: [
+          { name: '@me', value: req.user.userId },
+          { name: '@friend', value: friendId },
+        ],
+      })
+      .fetchAll();
+    if (resources.length === 0) return res.status(403).json({ error: 'Não são amigos' });
+
+    const { resources: games } = await libraryContainer.items
+      .query({
+        query: 'SELECT * FROM c WHERE c.userId = @userId',
+        parameters: [{ name: '@userId', value: friendId }],
+      })
+      .fetchAll();
+
+    res.json(games.map(({ gameId, name, thumbnail, image, rating, yearpublished }) => ({
+      id: gameId, name, thumbnail, image, rating, yearpublished,
+    })));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro ao buscar biblioteca do amigo' });
+  }
+});
+
+// GET /friends/:friendId/stats — estatísticas do amigo
+app.get('/friends/:friendId/stats', requireAuth, async (req, res) => {
+  const { friendId } = req.params;
+  try {
+    const { resources: friendship } = await friendshipsContainer.items
+      .query({
+        query: `SELECT * FROM c WHERE c.userId = @me AND c.status = 'accepted' AND (c.toUserId = @friend OR c.fromUserId = @friend)`,
+        parameters: [
+          { name: '@me', value: req.user.userId },
+          { name: '@friend', value: friendId },
+        ],
+      })
+      .fetchAll();
+    if (friendship.length === 0) return res.status(403).json({ error: 'Não são amigos' });
+
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+
+    const { resources: matches } = await matchesContainer.items
+      .query({
+        query: 'SELECT * FROM c WHERE c.userId = @userId AND c.playedAt >= @start',
+        parameters: [
+          { name: '@userId', value: friendId },
+          { name: '@start', value: startOfMonth },
+        ],
+      })
+      .fetchAll();
+
+    res.json(matches);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro ao buscar stats do amigo' });
+  }
+});
+// ── Recomendações personalizadas ───────────────────────────────────────────────
+
+// ── Recomendações personalizadas ───────────────────────────────────────────────
+
+app.get('/recommendations', requireAuth, async (req, res) => {
+  try {
+    // 1. Busca jogos mais jogados nas partidas
+    const { resources: matches } = await matchesContainer.items
+      .query({
+        query: 'SELECT * FROM c WHERE c.userId = @userId',
+        parameters: [{ name: '@userId', value: req.user.userId }],
+      })
+      .fetchAll();
+
+    const playCount = {};
+    for (const m of matches) {
+      playCount[m.gameId] = (playCount[m.gameId] || 0) + 1;
+    }
+    const topPlayed = Object.entries(playCount)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([id]) => id);
+
+    // 2. Busca jogos da biblioteca
+    const { resources: libraryGames } = await libraryContainer.items
+      .query({
+        query: 'SELECT * FROM c WHERE c.userId = @userId',
+        parameters: [{ name: '@userId', value: req.user.userId }],
+      })
+      .fetchAll();
+    const topLibrary = libraryGames.slice(0, 3).map(g => g.gameId);
+
+    const userGameIds = new Set([
+      ...libraryGames.map(g => g.gameId),
+      ...Object.keys(playCount),
+    ]);
+
+    // 3. Busca detalhes de um jogo e extrai categorias/mecânicas
+    const fetchGameDetails = async (gameId) => {
+      let attempts = 0;
+      let response;
+      do {
+        response = await axios.get(
+          `https://boardgamegeek.com/xmlapi2/thing?id=${gameId}&stats=1`,
+          { headers: { Authorization: `Bearer ${TOKEN}` } }
+        );
+        if (response.status === 202) {
+          attempts++;
+          await new Promise(r => setTimeout(r, 2000));
+        }
+      } while (response.status === 202 && attempts < 5);
+
+      const text = response.data;
+      if (typeof text !== 'string' || !text.trim().startsWith('<')) return null;
+
+      const parsed = await xml2js.parseStringPromise(text);
+      const item = parsed?.items?.item?.[0];
+      if (!item) return null;
+
+      const name = item.name?.[0]?.$.value ?? '';
+      const categories = (item.link || [])
+        .filter(l => l.$.type === 'boardgamecategory')
+        .map(l => l.$.value)
+        .slice(0, 2);
+      const mechanics = (item.link || [])
+        .filter(l => l.$.type === 'boardgamemechanic')
+        .map(l => l.$.value)
+        .slice(0, 2);
+
+      return { id: gameId, name, categories, mechanics };
+    };
+
+    // 4. Busca jogos por categoria/mecânica e retorna os melhores
+    const fetchByCategory = async (category) => {
+      try {
+        let attempts = 0;
+        let response;
+        do {
+          response = await axios.get(
+            `https://boardgamegeek.com/xmlapi2/search?query=${encodeURIComponent(category)}&type=boardgame&exact=0`,
+            { headers: { Authorization: `Bearer ${TOKEN}` } }
+          );
+          if (response.status === 202) {
+            attempts++;
+            await new Promise(r => setTimeout(r, 2000));
+          }
+        } while (response.status === 202 && attempts < 3);
+
+        const text = response.data;
+        if (typeof text !== 'string' || !text.trim().startsWith('<')) return [];
+
+        const parsed = await xml2js.parseStringPromise(text);
+        const items = parsed?.items?.item || [];
+
+        // Pega até 10 IDs que o usuário não tem
+        const ids = items
+          .map(i => i.$.id)
+          .filter(id => !userGameIds.has(id))
+          .slice(0, 10);
+
+        if (ids.length === 0) return [];
+
+        // Busca detalhes em batch
+        let detailAttempts = 0;
+        let detailResp;
+        do {
+          detailResp = await axios.get(
+            `https://boardgamegeek.com/xmlapi2/thing?id=${ids.join(',')}&stats=1`,
+            { headers: { Authorization: `Bearer ${TOKEN}` } }
+          );
+          if (detailResp.status === 202) {
+            detailAttempts++;
+            await new Promise(r => setTimeout(r, 2000));
+          }
+        } while (detailResp.status === 202 && detailAttempts < 5);
+
+        const detailText = detailResp.data;
+        if (typeof detailText !== 'string' || !detailText.trim().startsWith('<')) return [];
+
+        const detailParsed = await xml2js.parseStringPromise(detailText);
+        const detailItems = detailParsed?.items?.item || [];
+
+        return detailItems
+          .filter(i => i.thumbnail?.[0])
+          .map(i => ({
+            id: i.$.id,
+            name: i.name?.[0]?.$.value ?? '',
+            thumbnail: i.thumbnail?.[0] ?? '',
+            rating: parseFloat(
+              i.statistics?.[0]?.ratings?.[0]?.average?.[0]?.$.value ?? 0
+            ).toFixed(1),
+            yearpublished: i.yearpublished?.[0]?.$.value ?? '',
+          }))
+          .filter(g => parseFloat(g.rating) >= 6.5) // só jogos bem avaliados
+          .sort((a, b) => parseFloat(b.rating) - parseFloat(a.rating))
+          .slice(0, 6);
+      } catch (err) {
+        console.error('Erro ao buscar por categoria:', category, err.message);
+        return [];
+      }
+    };
+
+    // 5. Para cada jogo fonte, extrai categoria e busca similares
+    const fetchSimilar = async (gameId) => {
+      try {
+        const details = await fetchGameDetails(gameId);
+        if (!details) return { sourceId: gameId, sourceName: '', games: [] };
+
+        const { name: sourceName, categories, mechanics } = details;
+        console.log(`Jogo ${gameId} (${sourceName}) - categorias:`, categories, '- mecânicas:', mechanics);
+
+        // Usa a primeira categoria ou mecânica disponível
+        const searchTerm = categories[0] || mechanics[0];
+        if (!searchTerm) return { sourceId: gameId, sourceName, games: [] };
+
+        await new Promise(r => setTimeout(r, 500));
+        const games = await fetchByCategory(searchTerm);
+        const filtered = games.filter(g => g.id !== gameId && !userGameIds.has(g.id));
+
+        console.log(`Recomendações para ${sourceName} (${searchTerm}):`, filtered.length);
+        return { sourceId: gameId, sourceName, searchTerm, games: filtered };
+      } catch (err) {
+        console.error(`Erro ao buscar similares para ${gameId}:`, err.message);
+        return { sourceId: gameId, sourceName: '', games: [] };
+      }
+    };
+
+    // Executa em sequência
+    const playedRecs = [];
+    for (const id of topPlayed) {
+      const rec = await fetchSimilar(id);
+      playedRecs.push(rec);
+      await new Promise(r => setTimeout(r, 1000));
+    }
+
+    const libraryRecs = [];
+    for (const id of topLibrary) {
+      if (topPlayed.includes(id)) continue;
+      const rec = await fetchSimilar(id);
+      libraryRecs.push(rec);
+      await new Promise(r => setTimeout(r, 1000));
+    }
+
+    const filterRecs = (recs) => recs
+      .filter(r => r.games.length > 0)
+      .map(r => ({
+        sourceId: r.sourceId,
+        sourceName: r.sourceName,
+        searchTerm: r.searchTerm,
+        games: r.games.filter(g => !userGameIds.has(g.id)),
+      }))
+      .filter(r => r.games.length > 0);
+
+    const result = {
+      fromMatches: filterRecs(playedRecs),
+      fromLibrary: filterRecs(libraryRecs),
+    };
+
+    console.log('fromMatches final:', result.fromMatches.length, 'grupos');
+    console.log('fromLibrary final:', result.fromLibrary.length, 'grupos');
+
+    res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro ao buscar recomendações' });
+  }
+});
+
+
+// ── Lojas de jogos de tabuleiro próximas (OpenStreetMap + Overpass) ────────────
+
+// ── Lojas de jogos de tabuleiro próximas (OpenStreetMap + Overpass) ────────────
+
+const OVERPASS_SERVERS = [
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://overpass.private.coffee/api/interpreter',
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+  'https://overpass-api.de/api/interpreter',
+];
+
+app.get('/shop/nearby', async (req, res) => {
+  const { lat, lng, radius = 10000 } = req.query;
+  if (!lat || !lng) return res.status(400).json({ error: 'lat e lng obrigatórios' });
+
+  const overpassQuery = `[out:json][timeout:25];(node["shop"="games"](around:${radius},${lat},${lng});node["shop"="toy"](around:${radius},${lat},${lng});node["shop"="hobby"](around:${radius},${lat},${lng});way["shop"="games"](around:${radius},${lat},${lng});way["shop"="toy"](around:${radius},${lat},${lng});way["shop"="hobby"](around:${radius},${lat},${lng}););out center;`;
+
+  let lastError = null;
+
+  for (const server of OVERPASS_SERVERS) {
+    try {
+      console.log('Tentando servidor Overpass:', server);
+      const response = await axios.post(
+        server,
+        new URLSearchParams({ data: overpassQuery }).toString(),
+        {
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'User-Agent': 'HexaTracker/1.0 (board game shop finder)',
+            'Accept': 'application/json',
+          },
+          timeout: 30000,
+        }
+      );
+
+      const elements = response.data.elements || [];
+
+      const shops = elements.map(el => {
+        const tags = el.tags || {};
+        const elLat = el.lat ?? el.center?.lat;
+        const elLng = el.lon ?? el.center?.lon;
+
+        const R = 6371000;
+        const dLat = (elLat - parseFloat(lat)) * Math.PI / 180;
+        const dLng = (elLng - parseFloat(lng)) * Math.PI / 180;
+        const a = Math.sin(dLat/2)**2 +
+                  Math.cos(parseFloat(lat)*Math.PI/180) *
+                  Math.cos(elLat*Math.PI/180) *
+                  Math.sin(dLng/2)**2;
+        const distance = Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)));
+
+        return {
+          id: el.id,
+          name: tags.name || 'Loja sem nome',
+          lat: elLat,
+          lng: elLng,
+          distance,
+          address: [tags['addr:street'], tags['addr:housenumber'], tags['addr:city']]
+            .filter(Boolean).join(', ') || null,
+          phone: tags.phone || tags['contact:phone'] || null,
+          website: tags.website || tags['contact:website'] || null,
+          opening_hours: tags.opening_hours || null,
+          type: tags.shop,
+        };
+      })
+      .filter(s => s.lat && s.lng)
+      .sort((a, b) => a.distance - b.distance);
+
+      console.log(`Lojas encontradas: ${shops.length} via ${server}`);
+      return res.json(shops);
+
+    } catch (err) {
+      console.warn(`Servidor ${server} falhou:`, err.response?.status, err.message);
+      lastError = err;
+      continue;
+    }
+  }
+
+  console.error('Todos os servidores Overpass falharam');
+  res.status(500).json({ error: 'Serviço temporariamente indisponível. Tente novamente em alguns minutos.' });
+});
+
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`Servidor rodando na porta ${PORT}`);
